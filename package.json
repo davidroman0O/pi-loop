@@ -1,5 +1,5 @@
 {
-  "name": "pi-loop",
+  "name": "@davidroman/pi-loop",
   "version": "0.1.0",
   "description": "Reliable scheduled loops for the Pi coding agent — prompt/notify/shell/message on interval, once, or cron. Always-visible status, working input, bulletproof recurrence.",
   "license": "MIT",
@@ -17,10 +17,18 @@
   ],
   "type": "module",
   "main": "extensions/loop.ts",
+  "files": [
+    "extensions/",
+    "src/",
+    "README.md"
+  ],
   "pi": {
     "extensions": [
       "extensions/loop.ts"
     ]
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {
     "croner": "^10.0.1"

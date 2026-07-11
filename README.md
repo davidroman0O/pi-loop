@@ -7,7 +7,7 @@ Wake the agent with a prompt, fire a reminder, run a command, or post a message 
 ## Install
 
 ```bash
-pi install npm:davidroman0O/pi-loop
+pi install npm:@davidroman/pi-loop
 ```
 
 Then `/reload` in pi. You'll see the `🔁 loops` chip in the footer once a loop exists.

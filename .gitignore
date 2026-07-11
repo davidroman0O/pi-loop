@@ -1,3 +1,9 @@
 node_modules/
 .pi/loops.json
 *.tsbuildinfo
+
+# secrets — never commit
+.npmrc
+.env
+.env.*
+!.env.example
