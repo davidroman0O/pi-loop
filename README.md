@@ -1,18 +1,8 @@
 # pi-loop
 
-Reliable scheduled loops for the [Pi](https://github.com/earendil-works/pi-mono) coding agent.
+Scheduled loops for the [Pi](https://github.com/earendil-works/pi-mono) coding agent.
 
-Schedule a prompt, notification, shell command, or transcript message to fire on an **interval**, **once**, or **cron**. Always-visible status, working input, and bulletproof recurrence that survives restarts.
-
-## Why
-
-Three existing loop/scheduler plugins each broke differently. This one is built to fix all three:
-
-| Plugin | Bug | How pi-loop fixes it |
-|---|---|---|
-| trvon/pi-loop | No visible status indicator; 80+ files of sprawl | Always-on footer chip **+** a widget below the editor listing every loop with a live countdown. One file of extension glue. |
-| tintinweb/pi-schedule-prompt | Pressing Enter in the input makes text disappear | Add/manage flow uses **native dialogs only** (`select`/`input`/`confirm`). No overlays competing for keystrokes. |
-| jl1990/pi-scheduler | Interval/cron loops get cancelled right after the first fire | Authoritative state lives **in memory**; disk is a write-through mirror read **once** at startup. The next run is re-armed **before** the action runs, so a crash never loses recurrence. |
+Wake the agent with a prompt, fire a reminder, run a command, or post a message — on an **interval**, **once**, or **cron**. Always-visible status, reliable recurrence, survives restarts.
 
 ## Install
 
@@ -20,83 +10,143 @@ Three existing loop/scheduler plugins each broke differently. This one is built 
 pi install github.com/davidroman0O/pi-loop
 ```
 
-Or clone into your extensions dir:
+Or clone into your extensions dir, then `/reload`:
 
 ```bash
 git clone https://github.com/davidroman0O/pi-loop ~/.pi/agent/extensions/pi-loop
 cd ~/.pi/agent/extensions/pi-loop && npm install
 ```
 
-## Usage
+## Quick start
 
-### Commands
+Type this in your pi prompt:
 
 ```
-/loop 5m check the build         # quick: interval prompt loop named "check the build"
-/loop                            # interactive manager (add / list / pause / resume / delete)
-/loops                           # list all loops in the transcript
+/loop 5m check the build
 ```
 
-The `/loop` manager walks you through: action → schedule type → schedule → payload → name → max fires, re-prompting on invalid input. It never loses what you've already typed.
+That's it — an interval loop now wakes the agent with *"check the build"* every 5 minutes. The footer shows `🔁 1 loop · next 4m` and a widget below the editor tracks it with a live countdown.
 
-### Tools (the agent can self-schedule)
+## Creating loops
 
-| Tool | What it does |
-|---|---|
-| `schedule_loop` | Create a loop (prompt / notify / shell / message) on interval / once / cron. |
-| `list_loops` | List all loops with status and next run. |
-| `stop_loop` | Pause or delete a loop by id, id prefix, or unique name. |
+### One-liner (fastest)
 
-Let the agent poll CI, watch a build, or wake itself up: *"schedule a loop that runs `npm test` every 5 minutes and tells me the result, max 20 times."*
+```
+/loop <schedule> <prompt>
+```
+
+The prompt becomes the loop **name** (first few words) and the payload. Type is inferred from the schedule.
+
+```
+/loop 30s poll health            # interval
+/loop 1h30m sync the cache       # interval (compound duration)
+/loop +10m review the diff       # once, in 10 minutes
+/loop tomorrow 9am write notes   # once, at a clock time
+```
+
+### Interactive wizard — `/loop` with no args
+
+For **cron**, **non-prompt actions**, or to set a **max fire count**, use the wizard:
+
+```
+/loop
+```
+
+It walks you through, re-prompting on invalid input (you never lose what you already typed):
+
+1. **Action** → Prompt / Notify / Shell / Message
+2. **Schedule type** → Interval / Once / Cron
+3. **Schedule** → `5m`, `+10m`, `tomorrow 9am`, `*/5 * * * *`, …
+4. **Payload** → the prompt text / reminder / command
+5. **Name** → optional, defaults to an id
+6. **Max fires** → optional, stops after N runs (recurring only)
 
 ### Schedules
 
-- **Interval** — `5m`, `1h30m`, `30s`, `2h`, `hourly`, `daily`, `every 10m`, `in 1 hour`
-- **Once** — relative (`+10m`, `in 2 hours`) or absolute (`tomorrow 9am`, `9am`, `18:30`, `2026-01-01T09:00`)
-- **Cron** — standard 5-field expressions: `*/5 * * * *` (every 5 min), `0 9 * * 1-5` (9am weekdays), `0 */2 * * *` (every 2h)
+| Type | Examples |
+|---|---|
+| **interval** | `5m`, `1h30m`, `30s`, `2h`, `hourly`, `daily`, `every 10m`, `in 1 hour` |
+| **once** | `+10m`, `in 2 hours`, `tomorrow 9am`, `9am`, `18:30`, `2026-01-01T09:00` |
+| **cron** | `*/5 * * * *` (every 5 min), `0 9 * * 1-5` (9am weekdays), `0 */2 * * *` (every 2h) |
 
 ### Actions
 
-- **prompt** — wake the agent with a prompt (the headline use case: *"check the build"* on a loop)
-- **notify** — show a reminder toast (no agent wake)
-- **shell** — run a command on a schedule; optionally wake the agent with the output via `followUpPrompt`
-- **message** — post a line in the transcript, optionally triggering a turn
+| Action | Fires as | Use for |
+|---|---|---|
+| **prompt** | wakes the agent with a prompt | polling CI, periodic work — the main use |
+| **notify** | a toast reminder (no agent wake) | "standup in 5 min" |
+| **shell** | runs a command on schedule | `npm test` every 5m; optional `followUpPrompt` wakes the agent with the output |
+| **message** | a line in the transcript | logging, breadcrumbs; optionally triggers a turn |
 
-## Visibility
+## Controlling loops
 
-While any loop is active you'll see, at all times:
-
-- **Footer:** `🔁 2 loops · next 4m`
-- **Widget below the editor:**
-  ```
-    ● build-check   every 5m        in 4m         ×3   prompt
-    ○ standup       cron 0 9 * * 1-5 in 14h       ×0   prompt
-    ❚❚ deploys      every 1h        paused        ×12  shell
-  ```
-
-## Persistence
-
-Loops persist to `.pi/loops.json` in the project. Reopening the project re-arms them automatically. State is authoritative in memory while pi runs — the file is a write-through mirror, never reloaded mid-session (this is what avoids the disk-clobber recurrence bug).
-
-**One pi per project:** loops are project-scoped. If two pi instances run in the same project simultaneously, both will fire shared loops. The common single-developer case just works.
-
-## Architecture
+### Pause / Resume / Delete (one loop)
 
 ```
-extensions/loop.ts     # Pi glue: events, commands, tools, UI, fire loop (~600 lines)
-src/schedule.ts        # Parse + validate interval / once / cron, compute nextRun
-src/store.ts           # LoopStore (in-memory + write-through disk) + planFire (recurrence decision)
-src/format.ts          # Relative-time + schedule labels
-test/check.mjs         # Self-check: parsing, store round-trip, recurrence. Run: npx tsx test/check.mjs
+/loop  →  List / manage…  →  pick a loop  →  Pause · Resume · Run now · Delete
 ```
 
-Three guarantees, one place each:
+- **Pause** stops the timer but keeps the loop (widget shows `❚❚ paused`). Resumable.
+- **Resume** re-arms a paused loop.
+- **Delete** permanently removes it.
+- **Run now** fires immediately without waiting for the schedule.
 
-1. **Visible** — `setStatus` + `setWidget` in `updateUI()`, ticked every 30s and on every change/fire.
-2. **Input works** — `manage()` / `addLoop()` use only `ctx.ui.select/input/confirm`.
-3. **Recurrence holds** — `planFire()` (pure, tested) + re-arm-before-execute in `fire()`.
+### Bulk
 
-Cron recurrence is handled by [`croner`](https://github.com/hexagon/croner) (the single runtime dependency).
+From the `/loop` menu:
+
+- **Pause all** — stop every loop
+- **Resume all** — restart every paused loop
+- **Clear all** — permanently remove everything (asks for confirmation)
+
+### See what's running
+
+```
+/loops                          # lists every loop in the transcript
+```
+
+Or just glance at the widget under the editor:
+
+```
+  ● build-check    every 5m         in 4m        ×3   prompt
+  ○ standup        cron 0 9 * * 1-5 in 14h       ×0   prompt
+  ❚❚ deploys       every 1h         paused       ×12  shell
+  ✓ morning-sync   once +1h         done         ×1   prompt
+```
+
+| Glyph | Meaning |
+|---|---|
+| `●` | active |
+| `❚❚` | paused |
+| `✓` | done (one-shot fired, or maxFires reached) |
+| `✗` | errored |
+
+## Let the agent schedule itself
+
+The agent has `schedule_loop`, `list_loops`, and `stop_loop` tools — just ask in plain language:
+
+```
+Watch the build — run `npm test` every 5 minutes and tell me the result, max 20 times.
+```
+```
+Remind me to review the PR at 9am tomorrow.
+```
+```
+Poll /health every 30s and wake me up if it's not 200.
+```
+```
+pause the build-check loop
+```
+```
+delete the standup loop
+```
+
+`stop_loop` finds a loop by **id, id prefix, or unique name**.
+
+## Persistence & limits
+
+- Loops persist to `.pi/loops.json` in the project. Reopening the project re-arms them automatically; paused loops stay paused.
+- **One pi per project:** loops are project-scoped. Two pi instances in the same cwd will both fire shared loops — the single-developer case just works.
 
 ## License
 
