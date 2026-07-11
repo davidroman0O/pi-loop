@@ -115,17 +115,43 @@ Name matching is flexible: full id, id prefix, or unique name. With a single act
 
 ## When the agent is busy
 
-A loop can fire while the agent is mid-run (a long task, a goal skill, a stuck loop of tool calls). Two delivery policies handle this without flooding:
+A loop can fire while the agent is mid-run (a long task, a goal skill, a stuck loop of tool calls). To understand the two delivery policies, it helps to see how a run flows.
+
+### How a run flows (and where your loop lands)
+
+A Pi run is a loop of **turns**. A loop that fires mid-run has two places it can deliver — pick which one with `!`:
+
+```
+you send a prompt
+   │
+   ▼
+┌─ turn 1 ──────────────────────┐   a turn = one LLM reply + its tool calls
+│  think → bash → edit → …      │
+└───────────────────────────────┘
+   │  ◄── turn boundary: tools done, before the next LLM call   ← ! lands here
+   ▼
+┌─ turn 2 ──────────────────────┐
+│  think → bash → …             │
+└───────────────────────────────┘
+   │  ◄── turn boundary
+   ▼
+   … a goal skill can loop here for an hour …
+   ▼
+ settled                          the whole run is done — agent idle, nothing queued   ← default lands here
+```
+
+- **Turn boundary** — the yield point between one turn's tool calls and the next LLM call. Happens every few seconds.
+- **Settled** — the entire run is finished. Seconds away for a quick task; potentially an hour away for a long autonomous run.
+
+That gap is the whole reason `!` exists:
 
 | | Agent idle | Agent busy |
 |---|---|---|
-| **default** | fires immediately | coalesces → **one** delivery when the run **settles** (even if that's an hour away) |
-| **`!` forced** | fires immediately | coalesces per-turn → **steers in at the next tool-call boundary** (lands in seconds) |
+| **default** | fires immediately | coalesces → **one** delivery at **settled** (even if that's an hour away) |
+| **`!` forced** | fires immediately | coalesces per-turn → **steers in at the next turn boundary** (lands in seconds) |
 
-- **default** keeps long runs uninterrupted — fires batch up and land once when the agent finishes. Good for background polling ("check CI every 5m").
-- **`!`** is for timely triggers that can't wait — "remind me in 10m", "wake me if health checks fail". It injects between turns, coalesced so a `!5m` loop never bursts (max one injection per turn).
-
-The difference matters when a run drags on: default waits for the end; `!` breaks in at the next opportunity.
+- **default** stays out of the way and batches into one message when the agent finishes. Good for background polling ("check CI every 5m").
+- **`!`** interrupts within seconds — use it when waiting for the run to finish would defeat the trigger ("remind me in 10m", "wake me if health checks fail"). Coalesced so a `!5m` loop never bursts (max one injection per turn).
 
 ## See what's running
 
