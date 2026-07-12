@@ -423,7 +423,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		steeredThisTurn = true;
 		updateUI(ctx);
 		const body = forced.map((e) => e.prompt).join("\n\n---\n\n");
-		pi.sendUserMessage(`[Forced loops fired — interrupting at the next tool-call boundary]\n\n${body}`, { deliverAs: "steer" });
+		pi.sendUserMessage(body, { deliverAs: "steer" });
 	}
 
 	/** Drain buffered (default-deferred) fires as ONE consolidated user message. Called at agent_settled. */
@@ -433,10 +433,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const entries = [...pendingFires.values()];
 		pendingFires.clear();
 		updateUI(ctx);
-		const count = entries.length;
 		const body = entries.map((e) => e.prompt).join("\n\n---\n\n");
-		const consolidated = `[Loops fired while you were busy — ${count} queued, handling now]\n\n${body}`;
-		pi.sendUserMessage(consolidated);
+		pi.sendUserMessage(body);
 	}
 
 	function record(ctx: ExtensionContext, content: string, details?: Record<string, unknown>) {
