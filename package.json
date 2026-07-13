@@ -1,6 +1,6 @@
 {
   "name": "@davidroman/pi-loop",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Reliable scheduled loops for the Pi coding agent — prompt/notify/shell/message on interval, once, or cron. Always-visible status, working input, bulletproof recurrence.",
   "license": "MIT",
   "author": "davidroman0O",
