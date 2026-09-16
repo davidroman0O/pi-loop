@@ -29,7 +29,7 @@ import {
 	type ActionType,
 	type ScheduleType,
 } from "../src/schedule.ts";
-import { LoopStore, newId, planFire, type Loop } from "../src/store.ts";
+import { LoopStore, newId, planFire, shouldArm, type Loop, type LoopScope } from "../src/store.ts";
 import { getSettings, loadSettings, saveSettings, DEFAULT_SETTINGS, type RenderSettings, type FooterStyle } from "../src/settings.ts";
 import { formatRelative, loopPayloadPreview, loopPayloadRaw, loopScheduleLabel, safeParsed, displayName } from "../src/format.ts";
 
@@ -50,6 +50,11 @@ function truncateMiddle(text: string | undefined, max: number): string {
 
 function loopFilePath(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, "loops.json");
+}
+
+/** Per-session store: .pi/loops/<sessionId>.json — read/written only by the owner session. */
+function sessionLoopFilePath(cwd: string, sessionId: string): string {
+	return join(cwd, CONFIG_DIR_NAME, "loops", `${sessionId}.json`);
 }
 
 function statusGlyph(loop: Loop): string {
@@ -132,6 +137,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	let idleFlushTimer: ReturnType<typeof setTimeout> | undefined;
 	const IDLE_FLUSH_MS = 50;
 	let activeCtx: ExtensionContext | undefined;
+	/** Session id of this pi process (captured at session_start). Session loops arm only for their owner. */
+	let mySessionId: string | undefined;
 	let loopWidget: LoopWidget | undefined;
 	// Captured at widget mount so updateUI can force a render even if the widget
 	// component hasn't been instantiated yet (otherwise setStatus wouldn't paint).
@@ -202,8 +209,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const metaPlain = metaParts.join("  ");
 			const metaThemed = theme.fg("dim", metaPlain);
 
-			// Marks: ! (forced) + ⏳ (buffered). Themed.
-			const markThemed = (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
+			// Marks: ≡ (global) + ! (forced) + ⏳ (buffered). Themed.
+			const markThemed = (l.scope === "global" ? " " + theme.fg("dim", "≡") : "") + (l.force ? " " + theme.fg("warning", "!") : "") + (pendingFires.has(l.id) ? " " + theme.fg("warning", "⏳") : "");
 
 			// Title/payload flex slot = whatever width remains.
 			const indent = 2;
@@ -255,6 +262,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	/** Arm (or re-arm) a single loop's timer. Recomputes the next run. */
 	function arm(loop: Loop, ctx: ExtensionContext) {
 		if (!loop.enabled || loop.status === "done" || loop.status === "error") return;
+		if (!shouldArm(loop, mySessionId)) return; // session loops arm ONLY in the session that owns them
 		const parsed = safeParsed(loop);
 		if (!parsed) return;
 		disarm(loop.id);
@@ -502,6 +510,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 	function createLoop(params: {
 		action: ActionType;
 		type?: ScheduleType;
+		scope?: LoopScope;
 		schedule: string;
 		name?: string;
 		prompt?: string;
@@ -540,6 +549,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 		const loop = store.add(
 			{
 				name,
+				scope: params.scope ?? "session",
+				owner: mySessionId,
 				action: params.action,
 				type: parsed.type,
 				schedule: parsed.schedule,
@@ -598,7 +609,8 @@ export default function loopExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		store = new LoopStore(loopFilePath(ctx.cwd));
+		mySessionId = ctx.sessionManager.getSessionId();
+		store = new LoopStore(loopFilePath(ctx.cwd), sessionLoopFilePath(ctx.cwd, mySessionId));
 		await store.load();
 		await loadSettings();
 		pendingFires.clear();
@@ -834,34 +846,35 @@ export default function loopExtension(pi: ExtensionAPI) {
 				return controlLoop(verb, tokens.slice(1).join(" ").trim(), ctx);
 			}
 
-			// Optional action verb: /loop prompt|notify|shell|message <schedule> <payload>
+			// Scope modifier: leading `global` token(s) — /loop global [action] <schedule> <payload>
+			let scope: LoopScope = "session";
+			let t = 0;
+			while (tokens[t]?.toLowerCase() === "global") { scope = "global"; t++; }
+
+			// Optional action verb: /loop [global] prompt|notify|shell|message <schedule> <payload>
 			let action: ActionType = "prompt";
-			let rest = trimmed;
-			if (ACTION_VERBS.has(verb as ActionType)) {
-				action = verb as ActionType;
-				rest = tokens.slice(1).join(" ");
-				if (!rest) {
-					ctx.ui.notify(`Usage: /loop ${verb} <schedule> <payload>`, "warning");
-					return;
-				}
+			let rest = tokens.slice(t);
+			const restVerb = rest[0]?.toLowerCase();
+			if (ACTION_VERBS.has(restVerb as ActionType)) {
+				action = restVerb as ActionType;
+				rest = rest.slice(1);
 			}
 
 			// schedule = first remaining token, payload = the rest
-			const restTokens = tokenize(rest);
-			if (restTokens.length < 2) {
-				ctx.ui.notify("Usage: /loop [action] <schedule> <payload>", "warning");
+			if (rest.length < 2) {
+				ctx.ui.notify("Usage: /loop [global] [action] <schedule> <payload>", "warning");
 				return;
 			}
-			const schedule = restTokens[0];
-			const payload = restTokens.slice(1).join(" ");
+			const schedule = rest[0];
+			const payload = rest.slice(1).join(" ");
 
 			try {
-				const params: Parameters<typeof createLoop>[0] = { action, schedule, force };
+				const params: Parameters<typeof createLoop>[0] = { action, schedule, force, scope };
 				if (action === "prompt") params.prompt = payload;
 				else if (action === "notify" || action === "message") params.message = payload;
 				else if (action === "shell") params.command = payload;
 				const loop = createLoop(params, ctx);
-				ctx.ui.notify(`Created ${action} loop "${displayName(loop)}" (${loopScheduleLabel(loop)})${force ? " [forced]" : ""}`, "info");
+				ctx.ui.notify(`Created ${action} loop "${displayName(loop)}" (${loopScheduleLabel(loop)})${force ? " [forced]" : ""}${scope === "global" ? " [global ≡]" : ""}`, "info");
 			} catch (err) {
 				ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
 			}
@@ -923,6 +936,14 @@ export default function loopExtension(pi: ExtensionAPI) {
 			"Message — post a message in the transcript": "message",
 		};
 		const action = actionMap[actionChoice];
+
+		// 1b. Scope: session (default — only this pi) or global (every pi on this path)
+		const scopeChoice = await ctx.ui.select("Loop scope", [
+			"Session — this Pi session only (default)",
+			"Global ≡ — every pi in this project, survives restarts",
+			]);
+		if (!scopeChoice) return;
+		const scope: LoopScope = scopeChoice.startsWith("Session") ? "session" : "global";
 
 		// 2. Schedule type
 		const typeChoice = await ctx.ui.select("Schedule type", [
@@ -1003,7 +1024,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 
 		try {
 			const loop = createLoop(
-				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires, force },
+				{ action, type, schedule, name, prompt, message, command, followUpPrompt, maxFires, force, scope },
 				ctx,
 			);
 			ctx.ui.notify(`Created loop "${displayName(loop)}" (${loopScheduleLabel(loop)})`, "info");
@@ -1061,7 +1082,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
 			const preview = loopPayloadPreview(l);
 			const shortId = l.id.slice(0, 12);
-			const label = `${glyph} ${displayName(l)} [${shortId}] ${loopScheduleLabel(l)} · ${next} · ×${l.runCount} · ${l.action}${preview ? ` :: ${preview}` : ""}`;
+			const label = `${glyph}${l.scope === "global" ? " ≡" : ""} ${displayName(l)} [${shortId}] ${loopScheduleLabel(l)} · ${next} · ×${l.runCount} · ${l.action}${preview ? ` :: ${preview}` : ""}`;
 			labelToId.set(label, l.id);
 			return label;
 		});
@@ -1097,7 +1118,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		name: "schedule_loop",
 		label: "Schedule Loop",
 		description:
-			"Schedule a recurring or one-shot loop in this Pi session that can wake the agent with a prompt, run a shell command, post a message, or notify the user. Persists across restarts. Shows in the status bar.",
+			"Schedule a recurring or one-shot loop in this Pi session that can wake the agent with a prompt, run a shell command, post a message, or notify the user. Scope 'session' (default) fires only in this session; scope 'global' arms in every pi on this project path and survives restarts. Shows in the status bar.",
 		promptSnippet: "Schedule a recurring or one-shot loop (prompt/notify/shell/message) on a timer or cron",
 		promptGuidelines: [
 			"Use schedule_loop for periodic or deferred work — 'check CI every 5 min', 'remind me at 9am', 'poll until the build passes', 'run npm test hourly'.",
@@ -1112,6 +1133,11 @@ export default function loopExtension(pi: ExtensionAPI) {
 			action: StringEnum(["prompt", "notify", "shell", "message"] as const, {
 				description: "What the loop does when it fires. 'prompt' wakes the agent.",
 			}),
+			scope: Type.Optional(
+				StringEnum(["session", "global"] as const, {
+					description: "Where the loop fires. 'session' (default): only this Pi session, dies with it. 'global': every pi on this project path (legacy behavior), survives restarts.",
+				}),
+			),
 			type: Type.Optional(
 				StringEnum(["interval", "once", "cron"] as const, {
 					description: "Schedule type. If omitted, inferred from the schedule string.",
@@ -1149,7 +1175,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("schedule_loop"))} ${theme.fg("muted", args.action)}/${theme.fg("muted", args.type ?? "auto")} ${theme.fg("accent", args.schedule ?? "")}`,
+				`${theme.fg("toolTitle", theme.bold("schedule_loop"))} ${theme.fg("muted", args.action)}/${theme.fg("muted", args.type ?? "auto")}${args.scope === "global" ? theme.fg("dim", " ≡global") : ""} ${theme.fg("accent", args.schedule ?? "")}`,
 				0,
 				0,
 			);
@@ -1172,7 +1198,7 @@ export default function loopExtension(pi: ExtensionAPI) {
 			}
 			const lines = loops.map((l) => {
 				const next = l.nextRun && l.enabled ? formatRelative(l.nextRun, new Date()) : l.status;
-				return `- ${l.id} ${displayName(l)} [${l.action}/${l.type}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}`;
+				return `- ${l.id} ${displayName(l)} [${l.action}/${l.type}${l.scope === "global" ? " ≡global" : ""}] ${loopScheduleLabel(l)} next=${next} runs=${l.runCount}${l.lastStatus === "error" ? " last=error" : ""}`;
 			});
 			return {
 				content: [{ type: "text", text: `${loops.length} loop(s):\n${lines.join("\n")}` }],

@@ -3,7 +3,9 @@
 // INVARIANTS (these are what make recurring loops bulletproof, unlike jl1990
 // which reloaded from disk mid-fire and clobbered live reschedule state):
 //   1. In-memory Map is the single source of truth while pi is running.
-//   2. Disk is a write-through mirror: every mutation persists immediately.
+//   2. Disk is a write-through mirror: every mutation persists immediately,
+//      partitioned by scope: global loops → shared project file, session loops
+//      → .pi/loops/<sessionId>.json (one writer per file, no cross-session races).
 //   3. Disk is read ONCE, at session_start (load). No command/tool handler
 //      ever reloads from disk into the live map. This eliminates the entire
 //      class of "runtime state clobbered by stale disk read" bugs.
@@ -15,10 +17,15 @@ import { dirname } from "node:path";
 import { nextRun, validateSchedule, type ActionType, type ScheduleType } from "./schedule.ts";
 
 export type LoopStatus = "active" | "paused" | "done" | "error";
+export type LoopScope = "session" | "global";
 
 export interface Loop {
 	id: string;
 	name?: string;
+	/** Arming scope: "session" fires only in the owner session; "global" in every pi on this path (legacy behavior). */
+	scope: LoopScope;
+	/** Session id of the loop's owner (required for session scope; provenance only for global). */
+	owner?: string;
 	action: ActionType;
 	type: ScheduleType;
 	/** Normalized schedule expression. */
@@ -57,6 +64,8 @@ interface FileShape {
 
 export interface NewLoopInput {
 	name?: string;
+	scope?: LoopScope;
+	owner?: string;
 	action: ActionType;
 	type: ScheduleType;
 	schedule: string;
@@ -111,40 +120,51 @@ export function planFire(loop: Loop, now: Date = new Date()): FirePlan {
 	return { runCount, terminal, nextDelayMs };
 }
 
+/** Arming decision: global loops arm in every session on the path; session loops only in the session that owns them. */
+export function shouldArm(loop: Loop, sessionId: string | undefined): boolean {
+	if (loop.scope !== "session") return true;
+	return !!sessionId && loop.owner === sessionId;
+}
+
 export class LoopStore {
 	private loops = new Map<string, Loop>();
 	private filePath: string;
+	/** Per-session file for session-scoped loops. Only the owner session ever reads/writes it. */
+	private sessionFilePath?: string;
 	private saveQueue: Promise<void> = Promise.resolve();
 	private loaded = false;
 
-	constructor(filePath: string) {
+	/** @param filePath shared project file (global loops). @param sessionFilePath per-session file (session loops); when omitted, the store behaves exactly like the legacy single-file store. */
+	constructor(filePath: string, sessionFilePath?: string) {
 		this.filePath = filePath;
+		this.sessionFilePath = sessionFilePath;
 	}
 
-	/** Load from disk. Call once at session_start. Safe to call again (idempotent overwrite). */
+	/** Load from disk: the shared global file plus (when configured) this session's own file.
+	 * Call once at session_start. Safe to call again (idempotent overwrite).
+	 * Other sessions' files are deliberately NOT read — a session loop is invisible outside its owner. */
 	async load(): Promise<void> {
 		this.loaded = true;
-		let raw: string;
-		try {
-			raw = await readFile(this.filePath, "utf8");
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-				this.loops.clear();
-				return;
+		this.loops.clear();
+		const paths = this.sessionFilePath ? [this.filePath, this.sessionFilePath] : [this.filePath];
+		for (const p of paths) {
+			let raw: string;
+			try {
+				raw = await readFile(p, "utf8");
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+				throw err;
 			}
-			throw err;
-		}
-		try {
-			const parsed = JSON.parse(raw) as Partial<FileShape>;
-			const list = Array.isArray(parsed.loops) ? parsed.loops : [];
-			this.loops.clear();
-			for (const raw of list) {
-				const loop = normalizeLoop(raw);
-				if (loop) this.loops.set(loop.id, loop);
+			try {
+				const parsed = JSON.parse(raw) as Partial<FileShape>;
+				const list = Array.isArray(parsed.loops) ? parsed.loops : [];
+				for (const item of list) {
+					const loop = normalizeLoop(item);
+					if (loop) this.loops.set(loop.id, loop);
+				}
+			} catch {
+				// corrupt file: skip it, keep whatever loaded so far. (ponytail: no backup dance.)
 			}
-		} catch {
-			// corrupt file: start empty rather than crash. (ponytail: no backup dance.)
-			this.loops.clear();
 		}
 	}
 
@@ -180,6 +200,8 @@ export class LoopStore {
 		const loop: Loop = {
 			id,
 			name: input.name?.trim() || undefined,
+			scope: input.scope ?? "global",
+			owner: input.owner,
 			action: input.action,
 			type: input.type,
 			schedule: input.schedule,
@@ -224,25 +246,36 @@ export class LoopStore {
 		void this.persist();
 	}
 
-	/** Atomic, serialized write to disk. */
+	/** Atomic, serialized write to disk. Partitions by scope: global loops to the
+	 * shared project file, session loops to this session's file (single writer each).
+	 * Without a session path, everything writes to the shared file — legacy single-file mode. */
 	persist(): Promise<void> {
+		const loops = this.list();
+		const globalLoops = this.sessionFilePath ? loops.filter((l) => l.scope !== "session") : loops;
+		const sessionLoops = this.sessionFilePath ? loops.filter((l) => l.scope === "session") : [];
+		this.saveQueue = this.saveQueue.then(async () => {
+			await this.writeLoops(this.filePath, globalLoops);
+			if (this.sessionFilePath) await this.writeLoops(this.sessionFilePath, sessionLoops);
+		});
+		return this.saveQueue;
+	}
+
+	/** Atomic write (temp + rename) of one file's payload. Best-effort: never crashes the agent. */
+	private async writeLoops(path: string, loops: Loop[]): Promise<void> {
 		const payload: FileShape = {
 			version: 1,
 			updatedAt: new Date().toISOString(),
-			loops: this.list(),
+			loops,
 		};
 		const json = `${JSON.stringify(payload, null, 2)}\n`;
-		this.saveQueue = this.saveQueue.then(async () => {
-			try {
-				await mkdir(dirname(this.filePath), { recursive: true });
-				const tmp = `${this.filePath}.${process.pid}.tmp`;
-				await writeFile(tmp, json, "utf8");
-				await rename(tmp, this.filePath);
-			} catch {
-				// best-effort: a failed persist must not crash the agent.
-			}
-		});
-		return this.saveQueue;
+		try {
+			await mkdir(dirname(path), { recursive: true });
+			const tmp = `${path}.${process.pid}.tmp`;
+			await writeFile(tmp, json, "utf8");
+			await rename(tmp, path);
+		} catch {
+			// best-effort: a failed persist must not crash the agent.
+		}
 	}
 
 	get isLoaded(): boolean {
@@ -266,9 +299,14 @@ function normalizeLoop(raw: unknown): Loop | undefined {
 	const type = types.includes(r.type as ScheduleType) ? (r.type as ScheduleType) : "interval";
 	const statuses: LoopStatus[] = ["active", "paused", "done", "error"];
 	const status = statuses.includes(r.status as LoopStatus) ? (r.status as LoopStatus) : "active";
+	// Back-compat: records from before scopes existed (no scope/owner) load as global — today's shared behavior.
+	const owner = typeof r.owner === "string" && r.owner.trim() ? r.owner : undefined;
+	const scope: LoopScope = r.scope === "session" && owner ? "session" : "global";
 	return {
 		id: r.id,
 		name: typeof r.name === "string" && r.name.trim() ? r.name : undefined,
+		scope,
+		owner,
 		action,
 		type,
 		schedule: r.schedule,

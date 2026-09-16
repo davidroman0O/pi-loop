@@ -4,9 +4,10 @@
 import {
   parseDurationMs, validateSchedule, nextRun, inferType, describeSchedule,
 } from "../src/schedule.ts";
-import { LoopStore, newId, planFire } from "../src/store.ts";
+import { LoopStore, newId, planFire, shouldArm } from "../src/store.ts";
 import { formatRelative, loopScheduleLabel } from "../src/format.ts";
 import assert from "node:assert/strict";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 let failures = 0;
 const check = (name, fn) => { try { fn(); console.log("  ✓", name); } catch (e) { failures++; console.log("  ✗", name, "→", e.message); } };
@@ -90,6 +91,86 @@ console.log("# Live interval firing — 50ms x5, must fire exactly 5x then stop"
     const gaps = fires.slice(1).map((t, i) => t - fires[i]);
     assert.ok(gaps.every((g) => g > 30 && g < 200), `gaps: ${gaps.join(",")}`);
   });
+}
+
+console.log("# Scope/owner — shouldArm decision");
+{
+  const mk = (scope, owner) => ({ id: "x", scope, owner });
+  check("global arms in any session", () => assert.equal(shouldArm(mk("global", undefined), "anyone"), true));
+  check("session loop arms for owner", () => assert.equal(shouldArm(mk("session", "sessA"), "sessA"), true));
+  check("session loop does NOT arm for another session", () => assert.equal(shouldArm(mk("session", "sessA"), "sessB"), false));
+  check("session loop does not arm without session id", () => assert.equal(shouldArm(mk("session", "sessA"), undefined), false));
+}
+
+console.log("# Scope/owner — two-file storage round-trip");
+{
+  const dir = `/tmp/pi-loop-scope-${Date.now()}`;
+  const g = `${dir}/loops.json`, s = `${dir}/sessA.json`;
+  const st = new LoopStore(g, s);
+  const sid = newId(), gid = newId();
+  st.add({ action: "prompt", type: "interval", schedule: "5m", intervalMs: 300000, prompt: "mine", scope: "session", owner: "sessA" }, sid);
+  st.add({ action: "notify", type: "once", schedule: "+10m", message: "all", scope: "global" }, gid);
+  await st.persist();
+  const gRaw = JSON.parse(readFileSync(g, "utf8"));
+  const sRaw = JSON.parse(readFileSync(s, "utf8"));
+  check("session loop lives only in the session file", () => {
+    assert.equal(sRaw.loops.length, 1);
+    assert.equal(sRaw.loops[0].scope, "session");
+    assert.equal(sRaw.loops[0].owner, "sessA");
+    assert.ok(gRaw.loops.every((l) => l.id !== sid));
+  });
+  check("global loop lives only in the global file", () => {
+    assert.equal(gRaw.loops.length, 1);
+    assert.equal(gRaw.loops[0].scope, "global");
+    assert.ok(sRaw.loops.every((l) => l.id !== gid));
+  });
+  const st2 = new LoopStore(g, s);
+  await st2.load();
+  check("load merges global + own session file", () => assert.equal(st2.list().length, 2));
+}
+
+console.log("# Legacy back-compat — unowned records load as global");
+{
+  const dir = `/tmp/pi-loop-legacy-${Date.now()}`;
+  mkdirSync(dir, { recursive: true });
+  const g = `${dir}/loops.json`;
+  writeFileSync(g, JSON.stringify({
+    version: 1, updatedAt: new Date().toISOString(),
+    loops: [{ id: "loop_legacy1", action: "prompt", type: "interval", schedule: "5m", intervalMs: 300000, prompt: "old", runCount: 3, createdAt: "2025-01-01T00:00:00.000Z", status: "active" }],
+  }));
+  const st = new LoopStore(g, `${dir}/sessA.json`);
+  await st.load();
+  check("legacy record loads as global", () => {
+    const l = st.get("loop_legacy1");
+    assert.equal(l.scope, "global");
+    assert.equal(l.owner, undefined);
+  });
+  check("legacy record arms in any session (today's behavior)", () => assert.equal(shouldArm(st.get("loop_legacy1"), "anyone"), true));
+}
+
+console.log("# Two-terminal probe — A's session loop never arms or appears in B");
+{
+  const dir = `/tmp/pi-loop-twoterm-${Date.now()}`;
+  const g = `${dir}/loops.json`;
+  // Terminal A starts, creates one session loop + one global loop, persists.
+  const A = new LoopStore(g, `${dir}/sessA.json`);
+  await A.load();
+  const sidA = newId(), gid = newId();
+  A.add({ action: "prompt", type: "interval", schedule: "5m", intervalMs: 300000, prompt: "A only", scope: "session", owner: "sessA" }, sidA);
+  A.add({ action: "message", type: "interval", schedule: "1h", intervalMs: 3600000, message: "everyone", scope: "global" }, gid);
+  await A.persist();
+  // Terminal B starts on the same path: same global file, its own session file.
+  const B = new LoopStore(g, `${dir}/sessB.json`);
+  await B.load();
+  const armedIn = (store, sid) => store.list().filter((l) => shouldArm(l, sid)).map((l) => l.id);
+  check("B never even sees A's session loop", () => assert.equal(B.list().some((l) => l.id === sidA), false));
+  check("B sees and arms the global loop", () => assert.deepEqual(armedIn(B, "sessB"), [gid]));
+  check("A arms its own session loop + the global loop", () => assert.deepEqual(armedIn(A, "sessA").sort(), [gid, sidA].sort()));
+  // B mutating the global file must not touch A's session file (single writer).
+  B.remove(gid);
+  await B.persist();
+  const sRawA = JSON.parse(readFileSync(`${dir}/sessA.json`, "utf8"));
+  check("B's persist leaves A's session file untouched", () => assert.equal(sRawA.loops.length, 1));
 }
 
 console.log(failures === 0 ? "\n✅ ALL CHECKS PASSED" : `\n❌ ${failures} CHECK(S) FAILED`);

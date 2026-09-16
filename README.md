@@ -2,7 +2,7 @@
 
 Scheduled loops for the [Pi](https://github.com/earendil-works/pi-mono) coding agent.
 
-Wake the agent with a prompt, fire a reminder, run a command, or post a message — on an **interval**, **once**, or **cron**. Always-visible status, reliable recurrence, survives restarts. Loops coalesce cleanly during long agent runs; prefix `!` to force one to **interrupt mid-run**.
+Wake the agent with a prompt, fire a reminder, run a command, or post a message — on an **interval**, **once**, or **cron**. Always-visible status, reliable recurrence, clean session/global scoping. Session loops (the default) fire only in the pi that created them; global loops (`≡`) arm in every pi on the project path and survive restarts. Loops coalesce cleanly during long agent runs; prefix `!` to force one to **interrupt mid-run**.
 
 ## Install
 
@@ -31,6 +31,7 @@ Everything is one command. The **first token** decides what happens:
 /loop <schedule> <prompt>              quick prompt loop (schedule-first shortcut)
 /loop <action> <schedule> <payload>    explicit action: prompt / notify / shell / message
 /loop !<schedule> <prompt>             forced loop — interrupt mid-run if the agent is busy
+/loop global <schedule> <prompt>       global loop — fires in every pi on this path
 /loop <verb> <name|id>                 control: pause / resume / delete / run
 ```
 
@@ -169,6 +170,7 @@ No command needed — the widget under the editor always shows every loop:
 | `●` | active |
 | `❚❚` | paused |
 | `✗` | errored (last run failed) |
+| `≡` | global loop — fires in every pi on this path |
 | `!` | forced loop — interrupts mid-run when busy |
 | `⏳` | a fire is buffered (waiting to deliver) |
 
@@ -199,10 +201,11 @@ delete the standup loop
 
 `stop_loop` finds a loop by **id, id prefix, or unique name**.
 
-## Persistence & limits
+## Persistence, scope & limits
 
-- Loops persist to `.pi/loops.json` in the project. Reopening the project re-arms them automatically; paused loops stay paused.
-- **One pi per project:** loops are project-scoped. Two pi instances in the same cwd will both fire shared loops — the single-developer case just works.
+- **Session scope (default):** a loop fires only in the Pi session that created it. It lives in `.pi/loops/<sessionId>.json`, written only by that session, and goes inert when the session ends. Resuming the same session re-arms its loops (the session id survives a resume); `/new` and forks start clean.
+- **Global scope** (`/loop global …`, the wizard, or `schedule_loop`'s `scope` param): stored in the project's `.pi/loops.json`, loaded and armed by **every** pi instance on that path — two terminals will both fire global loops, and they survive restarts. Global loops are marked `≡` in the widget and `list_loops`.
+- Paused loops stay paused. Loops created before scopes existed load as global — behavior unchanged.
 
 ## License
 
